@@ -1112,6 +1112,73 @@ export default function App() {
   // =========================================================================
   // REQUIREMENT 2: AUTO-RECONNECT & SESSION RECOVERY (`reconnectSignalingAndPeer`)
   // =========================================================================
+  const handleRelayMessage = useCallback(
+    async (relay: E2EERelayClient, packet: E2EEEncryptedPayload) => {
+      if (packet.kind === 'ping_online' || packet.kind === 'presence:ping') {
+        setContacts((prev) =>
+          prev.map((c) =>
+            c.nrp === packet.senderNrp || c.peerId === packet.senderPeerId
+              ? { ...c, connectionState: 'CONNECTED', iceState: 'connected' }
+              : c
+          )
+        );
+        return;
+      }
+      const decryptedJson = await relay.decryptCiphertext(packet.ivB64, packet.ciphertextB64);
+      if (packet.kind === 'ack:delivered' || packet.kind === 'ack_delivered') {
+        updateMessageStatus(packet.senderPeerId, decryptedJson, 'DELIVERED');
+        return;
+      }
+      if (packet.kind === 'ack:read' || packet.kind === 'ack_read') {
+        updateMessageStatus(packet.senderPeerId, decryptedJson, 'VERIFIED');
+        return;
+      }
+      if (packet.kind === 'presence') return;
+
+      try {
+        const parsed: {
+          text: string;
+          fileMeta?: FileAttachmentMeta;
+          voiceMeta?: VoiceNoteMeta;
+        } = JSON.parse(decryptedJson);
+
+        appendMessage(packet.senderPeerId, {
+          id: packet.msgId || packet.id || `MSG-${Date.now()}`,
+          contactPeerId: packet.senderPeerId,
+          senderPeerId: packet.senderPeerId,
+          senderCallsign: packet.senderCallsign,
+          senderNrp: packet.senderNrp,
+          timestamp: packet.timestamp,
+          kind: packet.kind as any,
+          plaintext: parsed.text || '',
+          ciphertextPreview: (packet.ciphertextB64 || '').slice(0, 24),
+          ivHex: packet.ivB64 || '',
+          sha256Hash: packet.sha256Hash || '',
+          byteLength: decryptedJson.length,
+          status: 'DELIVERED',
+          transport: 'E2EE HTTPS Relay (AES-256-GCM)',
+          fileMeta: parsed.fileMeta,
+          voiceMeta: parsed.voiceMeta,
+        });
+
+        await relay.dispatchEncryptedPayload({
+          msgId: `ACK-READ-${packet.msgId || packet.id}`,
+          senderPeerId: localIdentityRef.current.peerId,
+          senderCallsign: localIdentityRef.current.personnelName,
+          senderNrp: localIdentityRef.current.nrp,
+          targetNrp: packet.senderNrp,
+          targetPeerId: packet.senderPeerId,
+          kind: 'ack_read',
+          plaintext: packet.msgId || packet.id,
+          timestamp: Date.now(),
+        });
+      } catch {
+        // Ignore
+      }
+    },
+    [appendMessage, updateMessageStatus]
+  );
+
   const reconnectSignalingAndPeer = useCallback(() => {
     console.info('[SILENT LINK RECONNECT] Executing E2EE Relay reconnect...');
     if (wsRef.current) {
@@ -1134,59 +1201,10 @@ export default function App() {
       setWsSignalConnected(false);
     };
 
-    relay.onmessage = async (packet) => {
-      const decryptedJson = await relay.decryptCiphertext(packet.ivB64, packet.ciphertextB64);
-      if (packet.kind === 'ack:delivered') {
-        updateMessageStatus(packet.senderPeerId, decryptedJson, 'DELIVERED');
-        return;
-      }
-      if (packet.kind === 'ack:read') {
-        updateMessageStatus(packet.senderPeerId, decryptedJson, 'VERIFIED');
-        return;
-      }
-      if (packet.kind === 'presence') return;
-
-      try {
-        const parsed: {
-          text: string;
-          fileMeta?: FileAttachmentMeta;
-          voiceMeta?: VoiceNoteMeta;
-        } = JSON.parse(decryptedJson);
-
-        appendMessage(packet.senderPeerId, {
-          id: packet.msgId,
-          contactPeerId: packet.senderPeerId,
-          senderPeerId: packet.senderPeerId,
-          senderCallsign: packet.senderCallsign,
-          senderNrp: packet.senderNrp,
-          timestamp: packet.timestamp,
-          kind: packet.kind as any,
-          plaintext: parsed.text || '',
-          ciphertextPreview: packet.ciphertextB64.slice(0, 24),
-          ivHex: packet.ivB64,
-          sha256Hash: packet.sha256Hash,
-          byteLength: decryptedJson.length,
-          status: 'DELIVERED',
-          transport: 'E2EE HTTPS Relay (AES-256-GCM)',
-          fileMeta: parsed.fileMeta,
-          voiceMeta: parsed.voiceMeta,
-        });
-
-        await relay.dispatchEncryptedPayload({
-          msgId: `ACK-DELIV-${packet.msgId}`,
-          senderPeerId: localIdentityRef.current.peerId,
-          senderCallsign: localIdentityRef.current.personnelName,
-          senderNrp: localIdentityRef.current.nrp,
-          targetPeerId: packet.senderPeerId,
-          kind: 'ack:delivered',
-          plaintext: packet.msgId,
-          timestamp: Date.now(),
-        });
-      } catch {
-        // Ignore
-      }
+    relay.onmessage = (packet) => {
+      void handleRelayMessage(relay, packet);
     };
-  }, [appendMessage, updateMessageStatus]);
+  }, [handleRelayMessage]);
 
   // Operative Onboarding Handler
   const handleCompleteOperativeOnboarding = useCallback(
@@ -1339,58 +1357,9 @@ export default function App() {
             if (!isMounted) return;
             setWsSignalConnected(false);
           };
-          relay.onmessage = async (packet) => {
+          relay.onmessage = (packet) => {
             if (!isMounted) return;
-            const decryptedJson = await relay.decryptCiphertext(packet.ivB64, packet.ciphertextB64);
-            if (packet.kind === 'ack:delivered') {
-              updateMessageStatus(packet.senderPeerId, decryptedJson, 'DELIVERED');
-              return;
-            }
-            if (packet.kind === 'ack:read') {
-              updateMessageStatus(packet.senderPeerId, decryptedJson, 'VERIFIED');
-              return;
-            }
-            if (packet.kind === 'presence') return;
-
-            try {
-              const parsed: {
-                text: string;
-                fileMeta?: FileAttachmentMeta;
-                voiceMeta?: VoiceNoteMeta;
-              } = JSON.parse(decryptedJson);
-
-              appendMessage(packet.senderPeerId, {
-                id: packet.msgId,
-                contactPeerId: packet.senderPeerId,
-                senderPeerId: packet.senderPeerId,
-                senderCallsign: packet.senderCallsign,
-                senderNrp: packet.senderNrp,
-                timestamp: packet.timestamp,
-                kind: packet.kind as any,
-                plaintext: parsed.text || '',
-                ciphertextPreview: packet.ciphertextB64.slice(0, 24),
-                ivHex: packet.ivB64,
-                sha256Hash: packet.sha256Hash,
-                byteLength: decryptedJson.length,
-                status: 'DELIVERED',
-                transport: 'E2EE HTTPS Relay (AES-256-GCM)',
-                fileMeta: parsed.fileMeta,
-                voiceMeta: parsed.voiceMeta,
-              });
-
-              await relay.dispatchEncryptedPayload({
-                msgId: `ACK-DELIV-${packet.msgId}`,
-                senderPeerId: localIdentityRef.current.peerId,
-                senderCallsign: localIdentityRef.current.personnelName,
-                senderNrp: localIdentityRef.current.nrp,
-                targetPeerId: packet.senderPeerId,
-                kind: 'ack:delivered',
-                plaintext: packet.msgId,
-                timestamp: Date.now(),
-              });
-            } catch {
-              // Ignore
-            }
+            void handleRelayMessage(relay, packet);
           };
 
           return;
@@ -1433,58 +1402,9 @@ export default function App() {
         if (!isMounted) return;
         setWsSignalConnected(false);
       };
-      relay.onmessage = async (packet) => {
+      relay.onmessage = (packet) => {
         if (!isMounted) return;
-        const decryptedJson = await relay.decryptCiphertext(packet.ivB64, packet.ciphertextB64);
-        if (packet.kind === 'ack:delivered') {
-          updateMessageStatus(packet.senderPeerId, decryptedJson, 'DELIVERED');
-          return;
-        }
-        if (packet.kind === 'ack:read') {
-          updateMessageStatus(packet.senderPeerId, decryptedJson, 'VERIFIED');
-          return;
-        }
-        if (packet.kind === 'presence') return;
-
-        try {
-          const parsed: {
-            text: string;
-            fileMeta?: FileAttachmentMeta;
-            voiceMeta?: VoiceNoteMeta;
-          } = JSON.parse(decryptedJson);
-
-          appendMessage(packet.senderPeerId, {
-            id: packet.msgId,
-            contactPeerId: packet.senderPeerId,
-            senderPeerId: packet.senderPeerId,
-            senderCallsign: packet.senderCallsign,
-            senderNrp: packet.senderNrp,
-            timestamp: packet.timestamp,
-            kind: packet.kind as any,
-            plaintext: parsed.text || '',
-            ciphertextPreview: packet.ciphertextB64.slice(0, 24),
-            ivHex: packet.ivB64,
-            sha256Hash: packet.sha256Hash,
-            byteLength: decryptedJson.length,
-            status: 'DELIVERED',
-            transport: 'E2EE HTTPS Relay (AES-256-GCM)',
-            fileMeta: parsed.fileMeta,
-            voiceMeta: parsed.voiceMeta,
-          });
-
-          await relay.dispatchEncryptedPayload({
-            msgId: `ACK-DELIV-${packet.msgId}`,
-            senderPeerId: localIdentityRef.current.peerId,
-            senderCallsign: localIdentityRef.current.personnelName,
-            senderNrp: localIdentityRef.current.nrp,
-            targetPeerId: packet.senderPeerId,
-            kind: 'ack:delivered',
-            plaintext: packet.msgId,
-            timestamp: Date.now(),
-          });
-        } catch {
-          // Ignore
-        }
+        void handleRelayMessage(relay, packet);
       };
     };
 

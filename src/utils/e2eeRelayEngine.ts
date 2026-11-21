@@ -1,26 +1,50 @@
 /**
- * DETERMINISTIC ZERO-KNOWLEDGE E2EE RELAY ENGINE (WHATSAPP / SIGNAL MODEL)
- * - Uses exact shared network topic: https://ntfy.sh/diskomlekau_slk_net_526316_v3
- * - Deterministic Master Key via PBKDF2 (salt: DISKOMLEKAU-SLK-526316) for universal Admin <-> Client decryption.
- * - Zero WebRTC ICE / P2P checking (100% instant HTTPS POST + SSE stream over Port 443).
- * - Real-time Delivery Receipts (ACK_DELIVERED, ACK_READ) and Presence Join Confirmation.
+ * PURE NRP & VERCEL RELAY ENGINE WITH BROADCASTCHANNEL LOCAL FALLBACK
+ * - Uses clean NRP strings (e.g. "526316" or "666666").
+ * - Polls /api/relay?nrp=<myNrp> every 1500ms (Retrieve & Wipe).
+ * - BroadcastChannel('slk_diskomlekau_bus') fallback for same-device multi-tab testing.
+ * - AES-256-GCM Web Crypto API encryption.
+ * - Automatic PING_ONLINE and ACK_READ handling for double ticks (✓✓) and online status.
  */
 
 import { ProvisionedOperativeCredential } from '../types/tactical';
 
-const RELAY_TOPIC_URL = 'https://ntfy.sh/diskomlekau_slk_net_526316_v3';
-
 export interface E2EEEncryptedPayload {
   msgId: string;
+  id?: string;
   senderPeerId: string;
   senderCallsign: string;
   senderNrp: string;
+  targetNrp?: string;
   targetPeerId?: string;
-  kind: 'text' | 'image' | 'document' | 'voice' | 'ack:delivered' | 'ack:read' | 'presence' | 'join:confirmed';
-  ivB64: string;
-  ciphertextB64: string;
-  sha256Hash: string;
+  kind: 'text' | 'image' | 'document' | 'voice' | 'ack:delivered' | 'ack_delivered' | 'ack:read' | 'presence' | 'presence:ping' | 'ping_online' | 'ack_read' | 'join:confirmed';
+  ivB64?: string;
+  ciphertextB64?: string;
+  sha256Hash?: string;
   timestamp: number;
+  plaintext?: string;
+}
+
+export interface RelayTrafficStats {
+  myNrp: string;
+  sentCount: number;
+  receivedCount: number;
+  lastActiveTime: number;
+  activeEndpoint: string;
+  isOnlineViaApi: boolean;
+}
+
+const trafficStats: RelayTrafficStats = {
+  myNrp: '000000',
+  sentCount: 0,
+  receivedCount: 0,
+  lastActiveTime: Date.now(),
+  activeEndpoint: '/api/relay',
+  isOnlineViaApi: false,
+};
+
+export function getRelayTrafficStats(): RelayTrafficStats {
+  return { ...trafficStats };
 }
 
 const remoteInviteRegistry = new Map<string, ProvisionedOperativeCredential>();
@@ -34,19 +58,19 @@ export class E2EERelayClient {
   public onclose: (() => void) | null = null;
   public onmessage: ((payload: E2EEEncryptedPayload) => void) | null = null;
 
-  private eventSource: EventSource | null = null;
+  private pollTimer: number | null = null;
   private broadcastChannel: BroadcastChannel | null = null;
   private isConnected = false;
   private isDestroyed = false;
   private localPeerId = '';
   private localNrp = '';
-  private heartbeatTimer: number | null = null;
-  private processedNonces = new Set<string>();
   private sharedSessionKey: CryptoKey | null = null;
+  private processedIds = new Set<string>();
 
   constructor(localPeerId: string, localNrp: string) {
     this.localPeerId = localPeerId;
-    this.localNrp = localNrp;
+    this.localNrp = localNrp.trim().toUpperCase() || '000000';
+    trafficStats.myNrp = this.localNrp;
     void this.initDeterministicKey();
     this.initTransports();
   }
@@ -83,20 +107,18 @@ export class E2EERelayClient {
   }
 
   public getActiveTransportLabels(): string[] {
-    const labels: string[] = ['E2EE-RELAY-443', 'AES-256-GCM'];
-    if (this.broadcastChannel) labels.push('P2P-BUS');
+    const labels: string[] = [trafficStats.isOnlineViaApi ? 'VERCEL-API-RELAY' : 'LOCAL-BROADCAST-BUS', 'AES-256-GCM'];
     return labels;
   }
 
   private initTransports(): void {
-    // 1. BroadcastChannel for same-device multi-tab testing
     if (typeof BroadcastChannel !== 'undefined') {
       try {
-        const bc = new BroadcastChannel('silent_link_e2ee_bus');
+        const bc = new BroadcastChannel('slk_diskomlekau_bus');
         this.broadcastChannel = bc;
         bc.onmessage = (ev) => {
-          if (typeof ev.data === 'string') {
-            this.handleIncomingRawJson(ev.data, 'BC');
+          if (ev.data) {
+            this.handleIncomingPacket(ev.data, 'BC');
           }
         };
       } catch {
@@ -104,72 +126,60 @@ export class E2EERelayClient {
       }
     }
 
-    // 2. EventSource (SSE) over HTTPS port 443 via ntfy.sh
-    try {
-      const es = new EventSource(`${RELAY_TOPIC_URL}/sse`);
-      this.eventSource = es;
+    this.isConnected = true;
+    this.onopen?.();
 
-      es.onopen = () => {
-        if (this.isDestroyed) return;
-        this.isConnected = true;
-        this.onopen?.();
-      };
+    // Poll /api/relay?nrp=<myNrp> every 1500ms
+    this.pollTimer = window.setInterval(() => {
+      if (this.isDestroyed || !this.localNrp) return;
+      void this.pollServerlessRelay();
+    }, 1500);
 
-      es.onerror = () => {
-        if (!this.isConnected && navigator.onLine) {
-          this.isConnected = true;
-          this.onopen?.();
-        }
-      };
-
-      es.onmessage = (ev) => {
-        if (!ev.data || this.isDestroyed) return;
-        try {
-          const envelope = JSON.parse(ev.data);
-          const rawPayload = envelope.message || ev.data;
-          this.handleIncomingRawJson(rawPayload, 'SSE');
-        } catch {
-          this.handleIncomingRawJson(ev.data, 'SSE');
-        }
-      };
-    } catch {
-      // Fallback
-    }
-
-    // Guaranteed ONLINE status within < 1 second
+    // Initial PING_ONLINE
     window.setTimeout(() => {
-      if (!this.isConnected && !this.isDestroyed) {
-        this.isConnected = true;
-        this.onopen?.();
-      }
-    }, 250);
-
-    // Heartbeat timer
-    this.heartbeatTimer = window.setInterval(() => {
-      if (this.isConnected && this.localPeerId) {
-        this.sendPresenceHeartbeat();
-      }
-    }, 5000);
-
-    window.addEventListener('online', () => {
-      this.isConnected = true;
-    });
+      void this.dispatchEncryptedPayload({
+        msgId: `PING-${Date.now()}`,
+        senderPeerId: this.localPeerId,
+        senderCallsign: 'USER',
+        senderNrp: this.localNrp,
+        targetNrp: this.localNrp === '526316' ? 'ALL' : '526316',
+        kind: 'ping_online',
+        timestamp: Date.now(),
+      });
+    }, 400);
   }
 
-  private sendPresenceHeartbeat(): void {
-    void this.dispatchEncryptedPayload({
-      msgId: `HB-${Date.now()}`,
-      senderPeerId: this.localPeerId,
-      senderCallsign: 'SYSTEM',
-      senderNrp: this.localNrp,
-      kind: 'presence',
-      timestamp: Date.now(),
-    });
+  private async pollServerlessRelay(): Promise<void> {
+    try {
+      const res = await fetch(`/api/relay?nrp=${encodeURIComponent(this.localNrp)}`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        trafficStats.isOnlineViaApi = true;
+        trafficStats.activeEndpoint = '/api/relay';
+        if (data && Array.isArray(data.messages)) {
+          for (const pkt of data.messages) {
+            this.handleIncomingPacket(pkt, 'API');
+          }
+        }
+      } else {
+        trafficStats.isOnlineViaApi = false;
+        trafficStats.activeEndpoint = 'LOCAL-BUS-FALLBACK';
+      }
+    } catch {
+      trafficStats.isOnlineViaApi = false;
+      trafficStats.activeEndpoint = 'LOCAL-BUS-FALLBACK';
+    }
   }
 
   public publishRetainedInvite(cred: ProvisionedOperativeCredential): void {
     const cleanId = cred.assignedPeerId.trim().toUpperCase();
     remoteInviteRegistry.set(cleanId, cred);
+    if (cred.nrp) {
+      remoteInviteRegistry.set(cred.nrp.trim().toUpperCase(), cred);
+    }
   }
 
   public async encryptPlaintext(plaintext: string): Promise<{ ivB64: string; ciphertextB64: string; sha256Hash: string }> {
@@ -194,9 +204,9 @@ export class E2EERelayClient {
     return { ivB64, ciphertextB64, sha256Hash };
   }
 
-  public async decryptCiphertext(ivB64: string, ciphertextB64: string): Promise<string> {
-    if (!this.sharedSessionKey) {
-      await this.initDeterministicKey();
+  public async decryptCiphertext(ivB64?: string, ciphertextB64?: string): Promise<string> {
+    if (!ivB64 || !ciphertextB64 || !this.sharedSessionKey) {
+      return '[Gagal Mendekripsi]';
     }
     try {
       const iv = Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0));
@@ -218,6 +228,7 @@ export class E2EERelayClient {
     senderPeerId: string;
     senderCallsign: string;
     senderNrp: string;
+    targetNrp?: string;
     targetPeerId?: string;
     kind: E2EEEncryptedPayload['kind'];
     plaintext?: string;
@@ -226,11 +237,16 @@ export class E2EERelayClient {
     const textToEncrypt = payload.plaintext || payload.kind;
     const encrypted = await this.encryptPlaintext(textToEncrypt);
 
+    const cleanTargetNrp = (payload.targetNrp || '').trim().toUpperCase();
+    const cleanSenderNrp = (payload.senderNrp || '').trim().toUpperCase();
+
     const packet: E2EEEncryptedPayload = {
       msgId: payload.msgId,
+      id: payload.msgId,
       senderPeerId: payload.senderPeerId,
       senderCallsign: payload.senderCallsign,
-      senderNrp: payload.senderNrp,
+      senderNrp: cleanSenderNrp,
+      targetNrp: cleanTargetNrp,
       targetPeerId: payload.targetPeerId,
       kind: payload.kind,
       ivB64: encrypted.ivB64,
@@ -239,26 +255,29 @@ export class E2EERelayClient {
       timestamp: payload.timestamp,
     };
 
+    trafficStats.sentCount += 1;
+    trafficStats.lastActiveTime = Date.now();
+
     this.sendPacketToRelay(packet);
   }
 
   private sendPacketToRelay(packet: E2EEEncryptedPayload): void {
-    const serialized = JSON.stringify(packet);
-
+    // 1. Broadcast locally via BroadcastChannel
     if (this.broadcastChannel) {
       try {
-        this.broadcastChannel.postMessage(serialized);
+        this.broadcastChannel.postMessage(packet);
       } catch {
         // Ignore
       }
     }
 
-    void fetch(RELAY_TOPIC_URL, {
+    // 2. Send via fetch POST to /api/relay
+    void fetch('/api/relay', {
       method: 'POST',
-      body: serialized,
+      body: JSON.stringify(packet),
       headers: { 'Content-Type': 'application/json' },
     }).catch(() => {
-      // Ignore network errors on offline send
+      // Fallback handled by BroadcastChannel
     });
   }
 
@@ -266,13 +285,13 @@ export class E2EERelayClient {
     try {
       const parsed = JSON.parse(rawJsonString);
       void this.dispatchEncryptedPayload({
-        msgId: parsed.msgId || `PKT-${Date.now()}`,
+        msgId: parsed.msgId || parsed.id || `PKT-${Date.now()}`,
         senderPeerId: this.localPeerId,
         senderCallsign: 'USER',
         senderNrp: this.localNrp,
-        targetPeerId: parsed.targetPeerId,
-        kind: 'text',
-        plaintext: rawJsonString,
+        targetNrp: parsed.targetNrp || '526316',
+        kind: parsed.kind || 'text',
+        plaintext: parsed.plaintext || rawJsonString,
         timestamp: Date.now(),
       });
     } catch {
@@ -280,48 +299,69 @@ export class E2EERelayClient {
     }
   }
 
-  private handleIncomingRawJson(rawJson: string, source: string): void {
-    if (this.isDestroyed) return;
-    try {
-      const packet = JSON.parse(rawJson) as E2EEEncryptedPayload;
-      if (!packet || !packet.msgId || !packet.senderPeerId) return;
-
-      if (this.processedNonces.has(packet.msgId)) return;
-      this.processedNonces.add(packet.msgId);
-      if (this.processedNonces.size > 1500) {
-        const first = this.processedNonces.values().next().value;
-        if (first) this.processedNonces.delete(first);
+  private handleIncomingPacket(packet: E2EEEncryptedPayload, source: string): void {
+    if (this.isDestroyed || !packet) return;
+    const pid = packet.msgId || packet.id;
+    if (pid) {
+      if (this.processedIds.has(pid)) return;
+      this.processedIds.add(pid);
+      if (this.processedIds.size > 1500) {
+        const first = this.processedIds.values().next().value;
+        if (first) this.processedIds.delete(first);
       }
-
-      // Ignore our own echoes (except BC if needed)
-      if (this.localPeerId && packet.senderPeerId === this.localPeerId && source !== 'BC') {
-        return;
-      }
-
-      // If targeted to a specific peer and not for us, ignore
-      if (packet.targetPeerId && this.localPeerId && packet.targetPeerId !== this.localPeerId) {
-        return;
-      }
-
-      this.onmessage?.(packet);
-    } catch {
-      // Ignore
     }
+
+    // Ignore our own echoes (except BroadcastChannel if needed, but filter by senderNrp)
+    const cleanSenderNrp = String(packet.senderNrp || '').trim().toUpperCase();
+    if (this.localNrp && cleanSenderNrp === this.localNrp && source !== 'BC') {
+      return;
+    }
+
+    // Filter by targetNrp if addressed specifically
+    const cleanTargetNrp = String(packet.targetNrp || '').trim().toUpperCase();
+    if (cleanTargetNrp && cleanTargetNrp !== 'ALL' && this.localNrp) {
+      if (cleanTargetNrp !== this.localNrp) {
+        return;
+      }
+    }
+
+    trafficStats.receivedCount += 1;
+    trafficStats.lastActiveTime = Date.now();
+
+    // If it's a PING_ONLINE packet, dispatch ACK or handle contact online status
+    if (packet.kind === 'ping_online' || packet.kind === 'presence:ping') {
+      // Send ACK or update contact
+      this.onmessage?.(packet);
+      return;
+    }
+
+    // If it's a message/file, trigger ACK_READ back to sender
+    if (packet.kind === 'text' || packet.kind === 'image' || packet.kind === 'document' || packet.kind === 'voice') {
+      // Dispatch ACK_READ back
+      if (cleanSenderNrp && cleanSenderNrp !== this.localNrp) {
+        void this.dispatchEncryptedPayload({
+          msgId: `ACK-${packet.msgId || Date.now()}`,
+          senderPeerId: this.localPeerId,
+          senderCallsign: 'SYSTEM',
+          senderNrp: this.localNrp,
+          targetNrp: cleanSenderNrp,
+          kind: 'ack_read',
+          plaintext: packet.msgId || '',
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    this.onmessage?.(packet);
   }
 
   public close(): void {
     this.isDestroyed = true;
     this.isConnected = false;
-    if (this.heartbeatTimer) {
-      window.clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+    if (this.pollTimer) {
+      window.clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
-    try {
-      this.eventSource?.close();
-    } catch {
-      // Ignore
-    }
-    this.eventSource = null;
     try {
       this.broadcastChannel?.close();
     } catch {

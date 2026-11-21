@@ -33,6 +33,56 @@ async function startServer() {
   const activeConnections = new Map<WebSocket, EphemeralPeerNode>();
   const ephemeralInvites = new Map<string, Record<string, unknown>>();
 
+  // Global memory queue for serverless / express relay simulation
+  const globalQueue = (globalThis as any).slkQueue || ((globalThis as any).slkQueue = []);
+
+  app.post('/api/relay', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    const packet = req.body || {};
+    if (!packet.targetNrp || !packet.senderNrp) {
+      res.status(400).json({ error: 'Missing targetNrp or senderNrp' });
+      return;
+    }
+    if (!packet.timestamp) packet.timestamp = Date.now();
+    if (!packet.id && packet.msgId) packet.id = packet.msgId;
+
+    globalQueue.push(packet);
+    if (globalQueue.length > 200) {
+      globalQueue.shift();
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/relay', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    const nrp = String(req.query.nrp || '').trim().toUpperCase();
+    if (!nrp) {
+      res.status(400).json({ error: 'Missing nrp query param' });
+      return;
+    }
+
+    const matchedMessages = [];
+    const remainingQueue = [];
+
+    for (const p of globalQueue) {
+      const target = String(p.targetNrp || '').trim().toUpperCase();
+      if (target === nrp || target === 'ALL') {
+        matchedMessages.push(p);
+      } else {
+        remainingQueue.push(p);
+      }
+    }
+    (globalThis as any).slkQueue = remainingQueue;
+
+    res.json({ messages: matchedMessages });
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'NOMINAL',
