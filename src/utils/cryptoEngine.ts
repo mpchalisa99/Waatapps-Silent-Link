@@ -1,6 +1,6 @@
 // Real End-to-End Encryption & RBAC Provisioning Engine using Web Crypto API
 // Algorithms: ECDH P-256 (Key Agreement), ECDSA P-256 (Admin Credential Signing), AES-256-GCM (Authenticated Payload Encryption), SHA-256
-// Zero-Data Retention for all chat messages/files/voice notes (RAM-only), with AES-256-GCM encrypted localStorage persistence for authorized device identity & auto-reconnect.
+// Zero-Data Retention for all chat messages/files/voice notes (RAM-only), with AES-256-GCM encrypted localStorage & IndexedDB persistence for authorized device identity & auto-reconnect.
 
 import { DeviceRole, ProvisionedOperativeCredential } from '../types/tactical';
 import { getCachedBrokerInvite } from './crossDeviceSignaling';
@@ -13,7 +13,7 @@ export interface EncryptedEnvelope {
   byteLength: number;
 }
 
-export type DeviceLockMode = 'MASTER_ADMIN' | 'OPERATIVE_LOCKED';
+export type DeviceLockMode = 'MASTER_ADMIN' | 'OPERATIVE_LOCKED' | 'UNREGISTERED';
 
 export interface PersistedPeerRecord {
   peerId: string;
@@ -27,7 +27,7 @@ export interface PersistedPeerRecord {
 }
 
 export interface PersistedDeviceAuthorization {
-  version: 3;
+  version: 4;
   deviceLockMode: DeviceLockMode;
   role: DeviceRole;
   peerId: string;
@@ -51,9 +51,76 @@ export interface PersistedDeviceAuthorization {
   savedAt: number;
 }
 
-const STORAGE_KEY_ENCRYPTED_IDENTITY = 'slk_diskomlekau_e2ee_identity_v3';
-const STORAGE_KEY_OPERATIVE_LOCK_FLAG = 'slk_diskomlekau_operative_lock_v3';
-const STORAGE_DEVICE_SALT = 'SILENTLINK-DISKOMLEKAU-TNI-AU-AES256GCM-IDENTITY-VAULT-V3';
+const STORAGE_KEY_ENCRYPTED_IDENTITY = 'slk_diskomlekau_e2ee_identity_v4';
+const STORAGE_KEY_OPERATIVE_LOCK_FLAG = 'slk_diskomlekau_operative_lock_v4';
+const STORAGE_DEVICE_SALT = 'SILENTLINK-DISKOMLEKAU-TNI-AU-AES256GCM-IDENTITY-VAULT-V4';
+
+// IndexedDB Persistence Helper for Force-Close resilience on Android APK / PWA
+const IDB_NAME = 'SilentLinkDiskomlekauVault';
+const IDB_STORE = 'identityStore';
+
+function openIndexedDBVault(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB not supported'));
+      return;
+    }
+    const request = indexedDB.open(IDB_NAME, 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+  });
+}
+
+async function saveToIndexedDB(key: string, value: string): Promise<void> {
+  try {
+    const db = await openIndexedDBVault();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    // Fallback handled by localStorage
+  }
+}
+
+async function loadFromIndexedDB(key: string): Promise<string | null> {
+  try {
+    const db = await openIndexedDBVault();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => resolve((req.result as string) || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function removeFromIndexedDB(key: string): Promise<void> {
+  try {
+    const db = await openIndexedDBVault();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    // Ignore
+  }
+}
 
 export function bufferToHex(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -108,9 +175,6 @@ function fromBase64Url(b64url: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-/**
- * Derives a device-bound AES-256-GCM key to encrypt/decrypt persisted identity credentials in localStorage
- */
 async function getLocalStorageVaultKey(): Promise<CryptoKey> {
   const deviceMaterial = `${STORAGE_DEVICE_SALT}::${typeof navigator !== 'undefined' ? navigator.userAgent.length : 0}`;
   const rawMaterial = new TextEncoder().encode(deviceMaterial);
@@ -136,7 +200,7 @@ export function lockDeviceAsOperative(): void {
   try {
     window.localStorage.setItem(STORAGE_KEY_OPERATIVE_LOCK_FLAG, 'OPERATIVE_LOCKED');
   } catch {
-    // Ignore storage quota errors
+    // Ignore
   }
 }
 
@@ -165,8 +229,8 @@ export async function importEcdsaPrivateKeyFromJwk(jwk: JsonWebKey): Promise<Cry
 }
 
 /**
- * Encrypts and persists authorized client/admin identity credentials in localStorage (AES-256-GCM)
- * Strictly stores ONLY identity & public key metadata (ZERO chat messages, files, or voice notes).
+ * Encrypts and persists authorized device identity in localStorage & IndexedDB (AES-256-GCM)
+ * Strictly stores ONLY identity credentials (ZERO chat messages, files, or voice notes).
  */
 export async function saveEncryptedDeviceIdentity(
   auth: PersistedDeviceAuthorization
@@ -179,23 +243,34 @@ export async function saveEncryptedDeviceIdentity(
     const jsonCleartext = JSON.stringify(auth);
     const encrypted = await encryptAES256GCM(vaultKey, jsonCleartext);
     const payload = JSON.stringify({
-      v: 3,
+      v: 4,
       ivB64: encrypted.ivB64,
       ciphertextB64: encrypted.ciphertextB64,
       sha256Hash: encrypted.sha256Hash,
     });
     window.localStorage.setItem(STORAGE_KEY_ENCRYPTED_IDENTITY, payload);
+    await saveToIndexedDB(STORAGE_KEY_ENCRYPTED_IDENTITY, payload);
   } catch (err) {
     console.warn('[SILENT LINK VAULT] Failed to save encrypted identity:', err);
   }
 }
 
 /**
- * Loads and decrypts persisted device identity from localStorage for instant auto-reconnect
+ * Loads and decrypts persisted device identity from localStorage or IndexedDB for instant auto-reconnect
  */
 export async function loadEncryptedDeviceIdentity(): Promise<PersistedDeviceAuthorization | null> {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY_ENCRYPTED_IDENTITY);
+    let raw = window.localStorage.getItem(STORAGE_KEY_ENCRYPTED_IDENTITY);
+    if (!raw) {
+      raw = await loadFromIndexedDB(STORAGE_KEY_ENCRYPTED_IDENTITY);
+      if (raw) {
+        try {
+          window.localStorage.setItem(STORAGE_KEY_ENCRYPTED_IDENTITY, raw);
+        } catch {
+          // Ignore
+        }
+      }
+    }
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !parsed.ivB64 || !parsed.ciphertextB64) return null;
@@ -221,11 +296,13 @@ export async function loadEncryptedDeviceIdentity(): Promise<PersistedDeviceAuth
 }
 
 /**
- * Completely revokes and deletes stored identity credentials from localStorage ("Cabut Otorisasi Perangkat")
+ * Completely revokes and deletes stored identity credentials from localStorage & IndexedDB ("Cabut Otorisasi Perangkat")
  */
 export function revokeEncryptedDeviceIdentity(): void {
   try {
     window.localStorage.removeItem(STORAGE_KEY_ENCRYPTED_IDENTITY);
+    window.localStorage.removeItem(STORAGE_KEY_OPERATIVE_LOCK_FLAG);
+    void removeFromIndexedDB(STORAGE_KEY_ENCRYPTED_IDENTITY);
   } catch {
     // Ignore
   }
@@ -445,7 +522,6 @@ export async function generateSignedProvisioningCredential(params: {
     throw new Error('Nama Personel dan NRP wajib diisi oleh Administrator.');
   }
 
-  // Generate guaranteed distinct Personnel ID and Credential ID on every single click
   const assignedPeerId = generateUniquePersonnelId(cleanNrp);
   const credRandHex = bufferToHex(window.crypto.getRandomValues(new Uint8Array(3)));
   const credentialId = `CRED-${cleanNrp}-${credRandHex}`;
@@ -497,7 +573,6 @@ export async function generateSignedProvisioningCredential(params: {
   const encryptedToken = `SLK2.${toBase64Url(JSON.stringify(bundle))}`;
   const originUrl = `${window.location.origin}${window.location.pathname}`;
 
-  // Compact, low-density QR Deep Link URL carrying target Signaling ID (?invite=SLK-ID-...), Admin Signaling ID (apid), and Admin ECDH P-256 public key coordinates (ax, ay)
   const compactQuery = new URLSearchParams({
     invite: assignedPeerId,
     apid: params.adminPeerId,
@@ -528,26 +603,12 @@ export async function generateSignedProvisioningCredential(params: {
     deepLinkUrl,
   };
 
-  // Store in volatile client RAM & server RAM (/api/invite) for zero-retention cross-device QR lookup
   localRamInviteRegistry.set(assignedPeerId.toUpperCase(), credentialObj);
   localRamInviteRegistry.set(credentialId.toUpperCase(), credentialObj);
-
-  if (typeof window !== 'undefined' && !window.location.hostname.endsWith('.vercel.app')) {
-    try {
-      await fetch('/api/invite', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(credentialObj),
-      });
-    } catch {
-      // Serverless / Vercel uses URL query params + MQTT WSS retained topic directly
-    }
-  }
 
   return credentialObj;
 }
 
-// Helper to verify a full SLK2 bundle's ECDSA P-256 signature
 async function verifyCredentialSignature(cred: ProvisionedOperativeCredential): Promise<boolean> {
   try {
     const signingPubKey = await window.crypto.subtle.importKey(
@@ -589,17 +650,11 @@ async function verifyCredentialSignature(cred: ProvisionedOperativeCredential): 
   }
 }
 
-// Operative Client Onboarding Parser & ECDSA Signature Verifier
-// Supports:
-// 1. Compact QR Code Deep Links (?invite=SLK-ID-... or ?join=SLK-ID-...&apid=...&ax=...&ay=...)
-// 2. 1D Code-128B Barcode strings (SLK-ID-... or *SLK-ID-...*)
-// 3. Full SLK2 Base64URL tokens (SLK2.... or ?silentlink_token=SLK2....)
 export async function verifyAndParseProvisioningToken(
   rawInput: string
 ): Promise<ProvisionedOperativeCredential> {
   const trimmed = rawInput.trim().replace(/^\*+|\*+$/g, '');
 
-  // Case 1: Compact QR Code Deep Link (?invite=SLK-ID-... or ?join=SLK-ID-...) or Raw Personnel ID (SLK-ID-...)
   let inviteId: string | null = null;
   let urlParams: URLSearchParams | null = null;
 
@@ -626,7 +681,6 @@ export async function verifyAndParseProvisioningToken(
     inviteId = trimmed.toUpperCase();
   }
 
-  // Also check if ?invite= or ?join= contained an SLK2 token directly
   if (inviteId && inviteId.startsWith('SLK2.')) {
     return verifyAndParseProvisioningToken(inviteId);
   }
@@ -634,41 +688,12 @@ export async function verifyAndParseProvisioningToken(
   if (inviteId) {
     const cleanInviteId = inviteId.trim().toUpperCase();
 
-    // 1A: Check local RAM registry or MQTT Retained Broker Invite Cache first
     const localFound =
       localRamInviteRegistry.get(cleanInviteId) || getCachedBrokerInvite(cleanInviteId);
     if (localFound) {
       return localFound;
     }
 
-    // 1B: Check volatile Server RAM (/api/invite/:id) if not on static Vercel
-    let partialAdminFromServer: {
-      adminPeerId?: string;
-      adminCallsign?: string;
-      adminPublicKeyJwk?: JsonWebKey;
-      adminFingerprint?: string;
-    } | null = null;
-
-    if (typeof window !== 'undefined' && !window.location.hostname.endsWith('.vercel.app')) {
-      try {
-        const resp = await fetch(`/api/invite/${encodeURIComponent(cleanInviteId)}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data && data.credential) {
-            const serverCred = data.credential as ProvisionedOperativeCredential;
-            await verifyCredentialSignature(serverCred);
-            return serverCred;
-          }
-          if (data && data.partialAdmin) {
-            partialAdminFromServer = data.partialAdmin;
-          }
-        }
-      } catch {
-        // Serverless / Vercel uses URL parameter reconstruction + MQTT WSS dynamic ECDH
-      }
-    }
-
-    // 1C: Reconstruct credential from URL query params (including embedded ECDH ax, ay coordinates & apid target Admin ID)
     const axParam = urlParams?.get('ax');
     const ayParam = urlParams?.get('ay');
     let embeddedAdminPubJwk: JsonWebKey | null = null;
@@ -684,25 +709,17 @@ export async function verifyAndParseProvisioningToken(
 
     const fallbackEcdh = await generateEphemeralECDHKeyPair();
     const fallbackSigning = await generateAdminSigningKeyPair();
-    const resolvedAdminPubJwk =
-      partialAdminFromServer?.adminPublicKeyJwk ||
-      embeddedAdminPubJwk ||
-      fallbackEcdh.publicKeyJwk;
-    const resolvedAdminFingerprint =
-      partialAdminFromServer?.adminFingerprint ||
-      (embeddedAdminPubJwk
-        ? await computeJwkFingerprint(embeddedAdminPubJwk)
-        : fallbackEcdh.fingerprint);
+    const resolvedAdminPubJwk = embeddedAdminPubJwk || fallbackEcdh.publicKeyJwk;
+    const resolvedAdminFingerprint = embeddedAdminPubJwk
+      ? await computeJwkFingerprint(embeddedAdminPubJwk)
+      : fallbackEcdh.fingerprint;
 
     const nrpFromId = cleanInviteId.split('-')[2] || '548921';
     const personnelName = (urlParams?.get('n') || `PERSONEL ${nrpFromId}`).toUpperCase();
     const nrp = (urlParams?.get('nrp') || nrpFromId).toUpperCase();
     const rank = (urlParams?.get('r') || 'OPERATIVE').toUpperCase();
     const unit = (urlParams?.get('u') || 'SATKOM DISKOMLEKAU').toUpperCase();
-    const adminPeerId =
-      partialAdminFromServer?.adminPeerId ||
-      urlParams?.get('apid') ||
-      'SLK-ADM-526316-0001';
+    const adminPeerId = urlParams?.get('apid') || 'SLK-ADM-526316-0001';
     const originUrl = `${window.location.origin}${window.location.pathname}`;
 
     return {
@@ -713,7 +730,7 @@ export async function verifyAndParseProvisioningToken(
       rank,
       assignedPeerId: cleanInviteId,
       adminPeerId,
-      adminCallsign: partialAdminFromServer?.adminCallsign || 'KOMANDO-01 [ADMIN HP]',
+      adminCallsign: 'KOMANDO-01 [ADMIN HP]',
       adminPublicKeyJwk: resolvedAdminPubJwk,
       adminSigningPublicKeyJwk: fallbackSigning.signingPublicKeyJwk,
       adminFingerprint: resolvedAdminFingerprint,
@@ -724,7 +741,6 @@ export async function verifyAndParseProvisioningToken(
     };
   }
 
-  // Case 2: Legacy or Full SLK2 Base64URL Token (?silentlink_token=SLK2... or SLK2...)
   let token = trimmed;
   if (token.includes('silentlink_token=')) {
     try {
