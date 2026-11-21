@@ -3,7 +3,7 @@
 // Zero-Data Retention for all chat messages/files/voice notes (RAM-only), with AES-256-GCM encrypted localStorage & IndexedDB persistence for authorized device identity & auto-reconnect.
 
 import { DeviceRole, ProvisionedOperativeCredential } from '../types/tactical';
-import { getCachedBrokerInvite } from './crossDeviceSignaling';
+import { getCachedRelayInvite } from './e2eeRelayEngine';
 
 export interface EncryptedEnvelope {
   ciphertextB64: string;
@@ -689,7 +689,7 @@ export async function verifyAndParseProvisioningToken(
     const cleanInviteId = inviteId.trim().toUpperCase();
 
     const localFound =
-      localRamInviteRegistry.get(cleanInviteId) || getCachedBrokerInvite(cleanInviteId);
+      localRamInviteRegistry.get(cleanInviteId) || getCachedRelayInvite(cleanInviteId);
     if (localFound) {
       return localFound;
     }
